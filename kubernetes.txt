@@ -1,0 +1,498 @@
+################################################################################
+# System
+################################################################################
+
+# selinux
+setenforce 0
+sed -i '/^SELINUX=/s/=.*$/=disabled/' /etc/selinux/config
+
+# iptables
+cat <<EOF >  /etc/sysctl.d/99-k8s.conf
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+sysctl --system
+
+# firewalld
+systemctl disable firewalld
+systemctl stop firewalld
+
+# module
+modprobe -- ip_vs
+modprobe -- ip_vs_rr
+modprobe -- ip_vs_wrr
+modprobe -- ip_vs_sh
+modprobe -- nf_conntrack_ipv4
+
+cat <<EOF > /etc/modules-load.d/ip_vs.conf
+ip_vs
+ip_vs_rr
+ip_vs_wrr
+ip_vs_sh
+nf_conntrack_ipv4
+EOF
+
+
+################################################################################
+# Docker
+################################################################################
+
+# rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/docker/libseccomp-2.3.1-3.el7.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/docker/libtool-ltdl-2.4.2-22.el7_3.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/docker/docker-ce-18.06.1.ce-3.el7.x86_64.rpm
+
+# docker
+mkdir -p /etc/docker
+cat <<EOF > /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-file": "10",
+    "max-size": "10m"
+  },
+  "insecure-registries": [
+    "http://docker.sunseaiot.cn"
+  ],
+  "registry-mirrors": [
+    "http://docker-group.sunseaiot.cn"
+  ]
+}
+EOF
+
+systemctl enable docker && systemctl start docker
+
+
+################################################################################
+# Kubernetes master base
+################################################################################
+
+# rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/ipvsadm-1.27-7.el7.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/socat-1.7.3.2-2.el7.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/cri-tools-1.12.0-0.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/kubernetes-cni-0.6.0-0.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/kubeadm-1.12.2-0.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/kubectl-1.12.2-0.x86_64.rpm
+rpm --install --nodeps http://products.sunseaiot.cn/development/kubernetes/kubernetes-1.12.2/kubelet-1.12.2-0.x86_64.rpm
+
+sed -i '/KUBELET_EXTRA_ARGS=/s/=.*/=--pod-infra-container-image=kubernetes\/pause:3.1/' /etc/sysconfig/kubelet
+
+# Images
+# kubeadm config images list
+docker pull kubernetes/keepalived:2.0.4
+
+docker pull kubernetes/kube-proxy:v1.12.2
+docker pull kubernetes/kube-apiserver:v1.12.2
+docker pull kubernetes/kube-controller-manager:v1.12.2
+docker pull kubernetes/kube-scheduler:v1.12.2
+docker pull kubernetes/etcd:3.2.24
+docker pull kubernetes/pause:3.1
+
+docker pull kubernetes/coredns:1.2.2
+docker pull kubernetes/flannel:v0.10.0-amd64
+
+
+################################################################################
+# Keepalived
+################################################################################
+
+# Master
+cat <<EOF > /etc/sysconfig/network-scripts/ifcfg-lo:0
+TYPE=Ethernet
+BOOTPROTO=static
+DEFROUTE=yes
+PEERDNS=yes
+PEERROUTES=yes
+IPV4_FAILURE_FATAL=no
+NAME=lo:0
+DEVICE=lo:0
+ONBOOT=yes
+IPADDR=10.96.0.1
+NETMASK=255.255.255.255
+EOF
+
+systemctl restart network
+
+ipvsadm -A -t 10.96.0.1:443 -s rr && ipvsadm -a -t 10.96.0.1:443 -r 192.168.100.130:6443 -m
+
+
+mkdir -p /etc/keepalived
+
+cat <<EOF > /etc/keepalived/keepalived.conf
+virtual_server 10.96.0.1 443 {
+    delay_loop 30
+    lb_algo rr
+    lb_kind NAT
+    protocol TCP
+
+    real_server 192.168.100.130 6443 {
+        TCP_CHECK {
+            connect_port 6443
+            connect_timeout 3
+        }
+    }
+
+    real_server 192.168.100.140 6443 {
+        TCP_CHECK {
+            connect_port 6443
+            connect_timeout 3
+        }
+    }
+
+    real_server 192.168.100.136 6443 {
+        TCP_CHECK {
+            connect_port 6443
+            connect_timeout 3
+        }
+    }
+}
+EOF
+
+mkdir -p /etc/kubernetes/manifests
+
+cat <<EOF > /etc/kubernetes/manifests/keepalived.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    scheduler.alpha.kubernetes.io/critical-pod: ""
+  creationTimestamp: null
+  labels:
+    component: keepalived
+    tier: control-plane
+  name: keepalived
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - keepalived
+    - --dont-fork
+    - --no-syslog
+    - --log-console
+    image: kubernetes/keepalived:2.0.4
+    imagePullPolicy: IfNotPresent
+    name: keepalived
+    resources: {}
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN"]
+    volumeMounts:
+    - mountPath: /etc/keepalived/keepalived.conf
+      name: keepalived-conf
+  hostNetwork: true
+  priorityClassName: system-cluster-critical
+  volumes:
+  - hostPath:
+      path: /etc/keepalived/keepalived.conf
+      type: File
+    name: keepalived-conf
+status: {}
+EOF
+
+
+################################################################################
+# Kubernetes master base
+################################################################################
+
+sed -i '/k8s-master/d' /etc/hosts && sed -i '$a10.96.0.1 k8s-master' /etc/hosts
+
+# Kubeadm Config
+NODE_JOIN=$'\n''      initial-cluster-state: existing'
+NODE_HOSTNAME=$(hostname)
+
+LOAD_BALANCER_DNS=k8s-master
+LOAD_BALANCER_PORT=443
+
+NODE_HOSTS=(
+k8s-00=192.168.100.130
+k8s-01=192.168.100.143
+k8s-02=192.168.100.136
+)
+
+NODE_IP=""
+INITIAL_CLUSTER=""
+for NODE_IP in ${NODE_HOSTS[@]}; do
+    INITIAL_CLUSTER="${INITIAL_CLUSTER:+${INITIAL_CLUSTER},}"
+    INITIAL_CLUSTER="${INITIAL_CLUSTER}${NODE_IP%%=*}=https://${NODE_IP##*=}:2380"
+
+    if [ "${NODE_IP%%=*}" = "${NODE_HOSTNAME}" ]; then
+        NODE_IP="${NODE_IP##*=}"
+        break
+    fi
+done
+
+cat <<EOF > kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1alpha3
+kind: ClusterConfiguration
+kubernetesVersion: v1.12.2
+apiServerCertSANs:
+- "${LOAD_BALANCER_DNS}"
+controlPlaneEndpoint: "${LOAD_BALANCER_DNS}:${LOAD_BALANCER_PORT}"
+etcd:
+  local:
+    extraArgs:
+      listen-client-urls: "https://127.0.0.1:2379,https://${NODE_IP}:2379"
+      advertise-client-urls: "https://${NODE_IP}:2379"
+      listen-peer-urls: "https://${NODE_IP}:2380"
+      initial-advertise-peer-urls: "https://${NODE_IP}:2380"
+      initial-cluster: "${INITIAL_CLUSTER}"${NODE_JOIN}
+    serverCertSANs:
+      - ${NODE_HOSTNAME}
+      - ${NODE_IP}
+    peerCertSANs:
+      - ${NODE_HOSTNAME}
+      - ${NODE_IP}
+imageRepository: kubernetes
+networking:
+  podSubnet: "10.244.0.0/16"
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: "ipvs"
+EOF
+
+
+################################################################################
+# Kubernetes master main
+################################################################################
+
+# Kubelet
+systemctl enable kubelet && systemctl start kubelet
+
+# Kubeadm
+kubeadm init --config kubeadm-config.yaml
+
+# Kubectl
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+
+# pki
+cat <<EOF > ~/.ssh/config
+Host *
+    StrictHostKeyChecking no
+EOF
+
+USER=root
+
+NODE_HOSTS=(
+192.168.100.136
+)
+
+for host in ${NODE_HOSTS[@]}; do
+    ssh "${USER}@${host}" "mkdir -p /etc/kubernetes/pki /etc/kubernetes/pki/etcd"
+
+    scp /etc/kubernetes/pki/ca.crt              "${USER}@${host}:/etc/kubernetes/pki/ca.crt"
+    scp /etc/kubernetes/pki/ca.key              "${USER}@${host}:/etc/kubernetes/pki/ca.key"
+    scp /etc/kubernetes/pki/sa.key              "${USER}@${host}:/etc/kubernetes/pki/sa.key"
+    scp /etc/kubernetes/pki/sa.pub              "${USER}@${host}:/etc/kubernetes/pki/sa.pub"
+    scp /etc/kubernetes/pki/front-proxy-ca.crt  "${USER}@${host}:/etc/kubernetes/pki/front-proxy-ca.crt"
+    scp /etc/kubernetes/pki/front-proxy-ca.key  "${USER}@${host}:/etc/kubernetes/pki/front-proxy-ca.key"
+    scp /etc/kubernetes/pki/etcd/ca.crt         "${USER}@${host}:/etc/kubernetes/pki/etcd/ca.crt"
+    scp /etc/kubernetes/pki/etcd/ca.key         "${USER}@${host}:/etc/kubernetes/pki/etcd/ca.key"
+    scp /etc/kubernetes/admin.conf              "${USER}@${host}:/etc/kubernetes/admin.conf"
+done
+
+################################################################################
+# Kubernetes master other
+################################################################################
+
+# Kubeadm kubelet
+kubeadm alpha phase certs all --config kubeadm-config.yaml
+kubeadm alpha phase kubelet config write-to-disk --config kubeadm-config.yaml
+kubeadm alpha phase kubelet write-env-file --config kubeadm-config.yaml
+kubeadm alpha phase kubeconfig kubelet --config kubeadm-config.yaml
+
+# Kubelet
+systemctl enable kubelet && systemctl start kubelet
+
+# Etcd
+export KUBECONFIG=/etc/kubernetes/admin.conf
+MAIN_NODE_HOSTNAME=szx1-capella-k8s-dev-000
+MAIN_NODE_IP=192.168.5.157
+NODE_HOSTNAME=szx1-capella-k8s-dev-001
+NODE_IP=192.168.5.9
+
+kubectl exec -n kube-system etcd-${MAIN_NODE_HOSTNAME} -- etcdctl --ca-file /etc/kubernetes/pki/etcd/ca.crt --cert-file /etc/kubernetes/pki/etcd/peer.crt --key-file /etc/kubernetes/pki/etcd/peer.key --endpoints=https://${MAIN_NODE_IP}:2379 member add ${NODE_HOSTNAME} https://${NODE_IP}:2380
+
+kubeadm alpha phase etcd local --config kubeadm-config.yaml
+
+# Kubeadm
+kubeadm alpha phase kubeconfig all --config kubeadm-config.yaml
+kubeadm alpha phase controlplane all --config kubeadm-config.yaml
+kubeadm alpha phase mark-master --config kubeadm-config.yaml
+
+
+################################################################################
+# Kubernetes node
+################################################################################
+
+# System
+sed -i '/k8s-master/d' /etc/hosts && sed -i '$a10.96.0.1 k8s-master' /etc/hosts
+
+# Images
+docker pull kubernetes/keepalived:2.0.4
+
+docker pull kubernetes/kube-proxy:v1.12.2
+docker pull kubernetes/pause:3.1
+docker pull kubernetes/flannel:v0.10.0-amd64
+
+# Kubelet
+systemctl enable kubelet && systemctl start kubelet
+
+# Join
+kubeadm join ha.k8s.example.com:6443 --token 5ynki1.3erp9i3yo7gqg1nv --discovery-token-ca-cert-hash sha256:a00055bd8c710a9906a3d91b87ea02976334e1247936ac061d867a0f014ecd81
+
+kubectl label node k8s-02 node-role.kubernetes.io/worker=""
+
+
+################################################################################
+# Kubernetes Extend
+################################################################################
+
+# Kubectl
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+
+
+# flannel
+# curl -L https://raw.githubusercontent.com/coreos/flannel/v0.10.0/Documentation/kube-flannel.yml | sed -e '/image:/s/quay.io\/coreos/kubernetes/g' > kube-flannel.yml
+curl -L https://raw.githubusercontent.com/coreos/flannel/bc79dd1505b0c8681ece4de4c0d86c5cd2643275/Documentation/kube-flannel.yml | sed -e '/image:/s/quay.io\/coreos/kubernetes/g' > kube-flannel.yml
+kubectl apply -f  kube-flannel.yml
+
+
+# dashboard
+docker pull kubernetes/kubernetes-dashboard-amd64:v1.8.3
+docker tag kubernetes/kubernetes-dashboard-amd64:v1.8.3 k8s.gcr.io/kubernetes-dashboard-amd64:v1.8.3
+docker rmi -f kubernetes/kubernetes-dashboard-amd64:v1.8.3
+
+# spec:
+#   type: NodePort
+#   ports:
+#     - port: 443
+#       targetPort: 8443
+#       nodePort: 30000
+#   selector:
+#     k8s-app: kubernetes-dashboard
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v1.8.3/src/deploy/recommended/kubernetes-dashboard.yaml
+
+kubectl -n kube-system describe $(kubectl -n kube-system get secret -n kube-system -o name | grep namespace) | grep token
+
+# Admin skip
+cat <<EOF | kubectl create -f -
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-dashboard
+  labels:
+    k8s-app: kubernetes-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: kubernetes-dashboard
+  namespace: kube-system
+EOF
+
+
+# ingress-nginx
+docker pull kubernetes/defaultbackend:1.4
+docker pull kubernetes/nginx-ingress-controller:0.17.1
+
+docker tag kubernetes/defaultbackend:1.4              gcr.io/google_containers/defaultbackend:1.4
+docker tag kubernetes/nginx-ingress-controller:0.17.1 quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.17.1
+
+docker rmi -f kubernetes/defaultbackend:1.4
+docker rmi -f kubernetes/nginx-ingress-controller:0.17.1
+
+
+
+docker tag gcr.io/google_containers/defaultbackend:1.4                           docker.sunseaiot.cn/kubernetes/defaultbackend:1.4
+docker tag quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.17.1 docker.sunseaiot.cn/kubernetes/nginx-ingress-controller:0.17.1
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/nginx-0.17.1/deploy/mandatory.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/nginx-0.17.1/deploy/provider/baremetal/service-nodeport.yaml
+
+
+# Traefik
+kubectl apply -f https://raw.githubusercontent.com/containous/traefik/v1.6.5/examples/k8s/traefik-rbac.yaml
+
+curl https://raw.githubusercontent.com/containous/traefik/v1.6.5/examples/k8s/traefik-deployment.yaml | sed -e '/image:/s/$/:v1.6.5/g' | kubectl apply -f -
+
+kubectl apply -f https://raw.githubusercontent.com/containous/traefik/v1.6.5/examples/k8s/ui.yaml
+
+
+
+
+# Helm
+docker pull kubernetes/tiller:v2.9.1
+
+cat <<EOF | kubectl create -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tiller
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: tiller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: tiller
+    namespace: kube-system
+EOF
+
+helm init --tiller-image kubernetes/tiller:v2.9.1 --service-account tiller
+
+
+################################################################################
+# Hosts init
+################################################################################
+
+HOSTS=(
+szx1-capella-k8s-dev-000=192.168.5.19
+szx1-capella-k8s-dev-001=192.168.5.134
+szx1-capella-k8s-dev-002=192.168.5.93
+szx1-capella-k8s-dev-003=192.168.5.130
+szx1-capella-k8s-dev-004=192.168.5.90
+szx1-capella-k8s-dev-005=192.168.5.188
+szx1-capella-k8s-dev-006=192.168.5.83
+)
+
+for host in ${HOSTS[@]}; do
+    name=${host%%=*}
+    ip=${host%%=*}
+
+    # ssh conf
+    ssh root@${ip} "mkdir -p ~/.ssh"
+    # copy rsa
+    scp ~/.ssh/id_rsa_sunseaiot.pub root@${ip}:.ssh/authorized_keys
+
+    #ssh root@${ip} "echo hostnamectl set-hostname ${name} && reboot"
+done
+
+
+HOSTS=(
+k8s-00=192.168.100.130
+k8s-01=192.168.100.142
+k8s-02=192.168.100.136
+)
+for host in ${HOSTS[@]}; do
+    name=${host%%=*}
+    ip=${host%%=*}
+    timestamp=$(date +%s)
+
+    ssh root@${ip} "date -s @${timestamp}"
+done

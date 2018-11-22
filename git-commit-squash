@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+# Author: Lixin Chen <chenlixin@sunseagroup.com>
+# Version: 1.1.0
+# Data: 2018-07-11T20:00:00+08:00
+
+usage() {
+    echo "usage: git commit-squash [--repo <repository>] [--branch <branch>] [--fetch] --message <message>"
+    echo ""
+    echo "    -r, --repo <repository>     remote repository"
+    echo "    -b, --branch <branch>       squash base branch"
+    echo "    -f, --fetch                 fetch remote repository before squash commits"
+    echo "    -m, --message <message>     commit message"
+}
+
+squash() {
+    local repository="$1"; shift
+    local branch="$1"; shift
+    local fetch="$1"; shift
+    local message="$1"; shift
+
+    if [ "${fetch}" != "true" ] || git fetch "${repository}"; then
+        git merge  --quiet --message "Merge '${repository}/${branch}' into $(git rev-parse --abbrev-ref HEAD)" "${repository}/${branch}" && \
+        git reset  --quiet --soft "${repository}/${branch}" && \
+        git commit --message "${squash_message}"
+    fi
+}
+
+squash_repository="origin"
+squash_branch=""
+squash_fetch="false"
+squash_message=""
+
+while test $# != 0; do
+    case "$1" in
+    -r|--repo)
+        shift
+        squash_repository="$1"
+        ;;
+    -b|--branch)
+        shift
+        squash_branch="$1"
+        ;;
+    -f|--fetch)
+        squash_fetch="true"
+        ;;
+    -m|--message)
+        shift
+        squash_message="$1"
+        ;;
+    -h|--help)
+        shift
+        usage && exit 0
+        ;;
+    --)
+        shift
+        break
+        ;;
+    esac
+    shift
+done
+
+if [ -n "${squash_message}" ]; then
+    squash "${squash_repository}" "${squash_branch}" "${squash_fetch}" "${squash_message}"
+else
+    usage && exit 1
+fi
